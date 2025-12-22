@@ -95,16 +95,42 @@ int main(int argc, char *argv[]) {
 
 		// Child must stop again
 		if (!WIFSTOPPED(status)) {
-			std::cerr << "[Debugger] : Child did not stop after execve\n";
+			std::cerr << "[Debugger] : Child did not stop after execl\n";
 			return 1;
 		}
 
 		// Expect SIGTRAP here
 		int sig = WSTOPSIG(status);
 		if (sig != SIGTRAP) {
-			std::cerr << "[Debugger] : Unexpected stop signal after execve: " << sig << "\n";
+			std::cerr << "[Debugger] : Unexpected stop signal after execl: " << sig << "\n";
+			return 1;
+		} 
+
+		// the child is in stop/pause state currently after execl
+		cout << "[Debugger] : Enter breakpoint address (hex): 0x";
+		cin >> hex >> state.breakpoint_addr;
+
+		long data = ptrace(PTRACE_PEEKDATA, pid, reinterpret_cast<void*>(state.breakpoint_addr), nullptr);
+
+		if (data == -1 && errno) {
+			perror("ptrace(PEEKDATA)");
 			return 1;
 		}
+
+		// Save original byte
+		uint8_t original_byte = static_cast<uint8_t>(data & 0xFF);
+
+		// Replace lowest byte with INT3 (0xCC)
+		long patched_data = (data & ~0xFF) | 0xCC;
+
+		if (ptrace(PTRACE_POKEDATA, pid, reinterpret_cast<void*>(state.breakpoint_addr), reinterpret_cast<void*>(patched_data)) == -1) {
+			perror("ptrace(POKEDATA)");
+			return 1;
+		}
+
+		cout << "[Debugger] Breakpoint set at 0x" << hex << state.breakpoint_addr << "\n";
+
+		state.breakpoint_enabled = true;
 	} else {
 		perror("fork");
 		return 1;
