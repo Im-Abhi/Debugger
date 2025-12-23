@@ -11,16 +11,19 @@
 
 using namespace std;
 
+enum LastAction { NONE, CONTINUE, SINGLESTEP };
+
 struct Debugger_State {
 	pid_t child_pid;
 	uintptr_t breakpoint_addr;
 	bool breakpoint_enabled = false;
+	LastAction last_action;
 } state;
 
 int main(int argc, char *argv[]) {
 	// take the target binary from user input
 	if (argc < 2) {
-		std::cerr << "Usage: " << argv[0] << " <program-to-debug>\n";
+		cerr << "Usage: " << argv[0] << " <program-to-debug>\n";
         return 1;
 	}
 
@@ -61,7 +64,7 @@ int main(int argc, char *argv[]) {
 		if (WIFSTOPPED(status)) {
 			cout << "[Debugger] : Child process initial stopped with signal :" << WSTOPSIG(status) << endl;
 		} else if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP) {
-			std::cerr << "[Debugger] : Unexpected initial stop\n";
+			cerr << "[Debugger] : Unexpected initial stop\n";
 			return 1;
 		}
 
@@ -95,14 +98,14 @@ int main(int argc, char *argv[]) {
 
 		// Child must stop again
 		if (!WIFSTOPPED(status)) {
-			std::cerr << "[Debugger] : Child did not stop after execl\n";
+			cerr << "[Debugger] : Child did not stop after execl\n";
 			return 1;
 		}
 
 		// Expect SIGTRAP here
 		int sig = WSTOPSIG(status);
 		if (sig != SIGTRAP) {
-			std::cerr << "[Debugger] : Unexpected stop signal after execl: " << sig << "\n";
+			cerr << "[Debugger] : Unexpected stop signal after execl: " << sig << "\n";
 			return 1;
 		} 
 
@@ -131,6 +134,62 @@ int main(int argc, char *argv[]) {
 		cout << "[Debugger] Breakpoint set at 0x" << hex << state.breakpoint_addr << "\n";
 
 		state.breakpoint_enabled = true;
+
+		// let the child continue
+		ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+
+		state.last_action = CONTINUE;
+
+		// wait for the stop at breakpoint
+		if (waitpid(pid, &status, 0) == -1) {
+			perror("waitpid");
+			return 1;
+		}
+
+		// Detect child exit
+		if (WIFEXITED(status)) {
+			cout << "[Debugger] : Child exited with code " << WEXITSTATUS(status) << "\n";
+			return 1;
+		}
+
+		// Detect breakpoint hit (SIGTRAP) after CONTINUE
+		if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+			if (state.last_action == CONTINUE) {
+				// possible breakpoint 
+				struct user_regs_struct regs;
+				ptrace(PTRACE_GETREGS, pid, nullptr, &regs);
+
+				if (regs.rip - 1 == state.breakpoint_addr) {
+					cout << "[Debugger] Breakpoint hit at 0x" << hex << state.breakpoint_addr << "\n";
+					cout << "RIP = 0x" << regs.rip << "\n";
+					cout << "RSP = 0x" << regs.rsp << "\n";
+					cout << "RAX = 0x" << regs.rax << "\n";
+
+					// Step back RIP
+					regs.rip -= 1;
+					ptrace(PTRACE_SETREGS, pid, nullptr, &regs);
+
+					// Restore original instruction byte
+					long data = ptrace(PTRACE_PEEKDATA, pid, (void*)state.breakpoint_addr, nullptr);
+
+					long restored = (data & ~0xFF) | original_byte;
+					ptrace(PTRACE_POKEDATA, pid, (void*)state.breakpoint_addr, (void*)restored);
+
+					state.breakpoint_enabled = false;
+				}
+			}
+		
+			if (state.last_action == SINGLESTEP) {
+				long data = ptrace(PTRACE_PEEKDATA, pid,(void*)state.breakpoint_addr, nullptr);
+
+				long patched = (data & ~0xFF) | 0xCC;
+				ptrace(PTRACE_POKEDATA, pid, (void*)state.breakpoint_addr, (void*)patched);
+
+				state.breakpoint_addr = true;
+				state.last_action = CONTINUE;
+			}
+		}
+
 	} else {
 		perror("fork");
 		return 1;
