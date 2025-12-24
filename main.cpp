@@ -18,6 +18,7 @@ struct Debugger_State {
 	uintptr_t breakpoint_addr;
 	bool breakpoint_enabled = false;
 	LastAction last_action;
+	uint8_t original_byte;
 } state;
 
 int main(int argc, char *argv[]) {
@@ -76,7 +77,7 @@ int main(int argc, char *argv[]) {
 		// Make syscall traps distinguishable (important later)
 		options |= PTRACE_O_TRACESYSGOOD;
 
-		// (Optional but recommended) notify on execve
+		// (Optional but recommended) notify on execl
 		options |= PTRACE_O_TRACEEXEC;
 
 		if (ptrace(PTRACE_SETOPTIONS, pid, 0, options) == -1) {
@@ -84,13 +85,13 @@ int main(int argc, char *argv[]) {
 			return 1;
 		}
 
-		// Let the child run until execve() completes
+		// Let the child run until execl() completes
 		if (ptrace(PTRACE_CONT, pid, nullptr, nullptr) == -1) {
 			perror("ptrace(PTRACE_CONT)");
 			return 1;
 		}
 
-		// Wait for the execve trap
+		// Wait for the execl trap
 		if (waitpid(pid, &status, 0) == -1) {
 			perror("waitpid");
 			return 1;
@@ -109,23 +110,18 @@ int main(int argc, char *argv[]) {
 			return 1;
 		} 
 
-		// the child is in stop/pause state currently after execl
 		cout << "[Debugger] : Enter breakpoint address (hex): 0x";
 		cin >> hex >> state.breakpoint_addr;
 
-		long data = ptrace(PTRACE_PEEKDATA, pid, reinterpret_cast<void*>(state.breakpoint_addr), nullptr);
-
-		if (data == -1 && errno) {
-			perror("ptrace(PEEKDATA)");
-			return 1;
-		}
+		long data = ptrace(PTRACE_PEEKDATA, pid, (void*)state.breakpoint_addr, nullptr);
 
 		// Save original byte
-		uint8_t original_byte = static_cast<uint8_t>(data & 0xFF);
+		state.original_byte = static_cast<uint8_t>(data & 0xFF);
 
 		// Replace lowest byte with INT3 (0xCC)
 		long patched_data = (data & ~0xFF) | 0xCC;
 
+		// insert INT3 at lower byte
 		if (ptrace(PTRACE_POKEDATA, pid, reinterpret_cast<void*>(state.breakpoint_addr), reinterpret_cast<void*>(patched_data)) == -1) {
 			perror("ptrace(POKEDATA)");
 			return 1;
@@ -136,60 +132,100 @@ int main(int argc, char *argv[]) {
 		state.breakpoint_enabled = true;
 
 		// let the child continue
-		ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+		if (ptrace(PTRACE_CONT, pid, nullptr, nullptr) == -1) {
+			perror("ptrace(CONTINUE)");
+			return 1;
+		}
 
 		state.last_action = CONTINUE;
+		
+		while(1) {
+			if (waitpid(pid, &status, 0) == -1) {
+				perror("waitpid");
+				return 1;
+			}
 
-		// wait for the stop at breakpoint
-		if (waitpid(pid, &status, 0) == -1) {
-			perror("waitpid");
-			return 1;
-		}
+			// Detect child exit
+			if (WIFEXITED(status)) {
+				cout << "[Debugger] : Child exited with code " << WEXITSTATUS(status) << "\n";
+				break;
+			}
 
-		// Detect child exit
-		if (WIFEXITED(status)) {
-			cout << "[Debugger] : Child exited with code " << WEXITSTATUS(status) << "\n";
-			return 1;
-		}
+			if (WIFSIGNALED(status)) {
+				cout << "[Debugger] : Child terminated by signal " << WTERMSIG(status) << "\n";
+				break;
+			}
 
-		// Detect breakpoint hit (SIGTRAP) after CONTINUE
-		if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
-			if (state.last_action == CONTINUE) {
-				// possible breakpoint 
-				struct user_regs_struct regs;
-				ptrace(PTRACE_GETREGS, pid, nullptr, &regs);
+			// Detect breakpoint hit (SIGTRAP) after CONTINUE
+			if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+				if (state.last_action == CONTINUE) {
+					
+					struct user_regs_struct regs;
+					ptrace(PTRACE_GETREGS, pid, nullptr, &regs);
+					
+					if (regs.rip - 1 == state.breakpoint_addr) {
+						// possible breakpoint 
+						cout << "[Debugger] Breakpoint hit at 0x" << hex << state.breakpoint_addr << "\n";
+						cout << "RIP = 0x" << regs.rip << "\n";
+						cout << "RSP = 0x" << regs.rsp << "\n";
+						cout << "RAX = 0x" << regs.rax << "\n";
+						
+						// Restore original instruction byte 
+						long data = ptrace(PTRACE_PEEKDATA, pid, (void*)state.breakpoint_addr, nullptr); 
+						long restored = (data & ~0xFF) | state.original_byte; 
+						ptrace(PTRACE_POKEDATA, pid, (void*)state.breakpoint_addr, (void*)restored);
 
-				if (regs.rip - 1 == state.breakpoint_addr) {
-					cout << "[Debugger] Breakpoint hit at 0x" << hex << state.breakpoint_addr << "\n";
-					cout << "RIP = 0x" << regs.rip << "\n";
-					cout << "RSP = 0x" << regs.rsp << "\n";
-					cout << "RAX = 0x" << regs.rax << "\n";
+						// Step back RIP
+						regs.rip -= 1;
 
-					// Step back RIP
-					regs.rip -= 1;
-					ptrace(PTRACE_SETREGS, pid, nullptr, &regs);
+						if (ptrace(PTRACE_SETREGS, pid, nullptr, &regs) == -1) {
+							perror("ptrace(SETREGS)");
+							return 1;
+						}
 
-					// Restore original instruction byte
-					long data = ptrace(PTRACE_PEEKDATA, pid, (void*)state.breakpoint_addr, nullptr);
+						
+						if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1) {
+							perror("[Debugger] : ptrace\n");
+							return 1;
+						}
+						
+						state.last_action = SINGLESTEP;
+						state.breakpoint_enabled = false;
 
-					long restored = (data & ~0xFF) | original_byte;
-					ptrace(PTRACE_POKEDATA, pid, (void*)state.breakpoint_addr, (void*)restored);
+					} else {
+						// not breakpoint
+						if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
+							perror("ptrace(CONT)");
+							return 1;
+						}
 
-					state.breakpoint_enabled = false;
+						state.last_action = CONTINUE;
+						continue;
+					}
+
+				} else if (state.last_action == SINGLESTEP) {
+					// SINGLE STEP
+					long data = ptrace(PTRACE_PEEKDATA, pid,(void*)state.breakpoint_addr, nullptr);
+					
+					// reinsert INT3
+					long patched = (data & ~0xFF) | 0xCC;
+					
+					if (ptrace(PTRACE_POKEDATA, pid, (void*)state.breakpoint_addr, (void*)patched) == -1) {
+						perror("ptrace(POKEDATA restore)");
+						return 1;
+					}
+
+					state.breakpoint_enabled = true;
+
+					if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
+						perror("[Debugger] : ptrace\n");
+						return 1;
+					}
+
+					state.last_action = CONTINUE;
 				}
 			}
-		
-			if (state.last_action == SINGLESTEP) {
-				long data = ptrace(PTRACE_PEEKDATA, pid,(void*)state.breakpoint_addr, nullptr);
-
-				long patched = (data & ~0xFF) | 0xCC;
-				ptrace(PTRACE_POKEDATA, pid, (void*)state.breakpoint_addr, (void*)patched);
-
-				state.breakpoint_addr = true;
-				state.last_action = CONTINUE;
-			}
 		}
-
 	} else {
 		perror("fork");
 		return 1;
