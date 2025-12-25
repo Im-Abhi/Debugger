@@ -21,6 +21,7 @@ struct Debugger_State {
 	LastAction last_action;
 	uint8_t original_byte;
 	RunState run_state;
+	bool stepping_over_breakpoint = false;
 } state;
 
 uintptr_t parse_breakpoint(const string& cmd) {
@@ -37,89 +38,74 @@ uintptr_t parse_breakpoint(const string& cmd) {
     return stoull(cmd.substr(start), nullptr, 16);
 }
 
-void handle_debug_event(Debugger_State &state) {
-	int status;
-	waitpid(state.child_pid, &status, 0);
-
-	if (WIFEXITED(status) || WIFSIGNALED(status)) {
+void handle_debug_event(Debugger_State &state, int status) {
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
         state.run_state = EXITED;
         return;
     }
 
-	if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
         if (state.last_action == CONTINUE) {
-            // breakpoint logic
-			struct user_regs_struct regs;
-			ptrace(PTRACE_GETREGS, state.child_pid, nullptr, &regs);
-			
-			if (regs.rip - 1 == state.breakpoint_addr) {
-				// possible breakpoint 
-				cout << "[Debugger] Breakpoint hit at 0x" << hex << state.breakpoint_addr << "\n";
-				
-				// Restore original instruction byte 
-				long data = ptrace(PTRACE_PEEKDATA, state.child_pid, (void*)state.breakpoint_addr, nullptr); 
-				
+
+            struct user_regs_struct regs;
+            if (ptrace(PTRACE_GETREGS, state.child_pid, nullptr, &regs) == -1) {
+				perror("ptrace(GETREGS)");
+				return;
+			}
+
+            if (state.breakpoint_enabled && regs.rip - 1 == state.breakpoint_addr) {
+
+                cout << "[Debugger] Breakpoint hit at 0x" << hex << state.breakpoint_addr << "\n";
+
+                long data = ptrace(PTRACE_PEEKDATA, state.child_pid, (void*)state.breakpoint_addr, nullptr);
+
 				if (data == -1) {
 					perror("ptrace(PEEKDATA)");
 					return;
 				}
-				
-				long restored = (data & ~0xFF) | state.original_byte; 
-				
-				if (ptrace(PTRACE_POKEDATA, state.child_pid, (void*)state.breakpoint_addr, (void*)restored) == -1) {
-					perror("ptrace(POKEDATA)");
+
+                long restored = (data & ~0xFF) | state.original_byte;
+
+                if (ptrace(PTRACE_POKEDATA, state.child_pid, (void*)state.breakpoint_addr, (void*)restored) == -1) {
+					perror("ptrace(POKEDATA");
 					return;
 				}
 
-				// Step back RIP
-				regs.rip -= 1;
-
+                regs.rip -= 1;
+                
 				if (ptrace(PTRACE_SETREGS, state.child_pid, nullptr, &regs) == -1) {
 					perror("ptrace(SETREGS)");
 					return;
 				}
 
-				if (ptrace(PTRACE_SINGLESTEP, state.child_pid, 0, 0) == -1) {
-					perror("[Debugger] : ptrace\n");
-					return;
-				}
-				
-				state.last_action = SINGLESTEP;
-				state.breakpoint_enabled = false;
+				state.stepping_over_breakpoint = true;
+                state.breakpoint_enabled = false;
+                state.last_action = NONE;
+            }
+        }
 
-			} else {
-				// not breakpoint
-				if (ptrace(PTRACE_CONT, state.child_pid, 0, 0) == -1) {
-					perror("ptrace(CONT)");
-					return;
-				}
+        else if (state.last_action == SINGLESTEP && state.stepping_over_breakpoint) {
+            long data = ptrace(PTRACE_PEEKDATA, state.child_pid, (void*)state.breakpoint_addr, nullptr);
 
-				state.last_action = CONTINUE;
+			if (data == -1) {
+				perror("ptrace(PEEKDATA)");
+				return;
 			}
-        } else if (state.last_action == SINGLESTEP) {
-            // reinsertion logic
-			long data = ptrace(PTRACE_PEEKDATA, state.child_pid,(void*)state.breakpoint_addr, nullptr);
-					
-			// reinsert INT3
-			long patched = (data & ~0xFF) | 0xCC;
-			
+
+            long patched = (data & ~0xFF) | 0xCC;
+
 			if (ptrace(PTRACE_POKEDATA, state.child_pid, (void*)state.breakpoint_addr, (void*)patched) == -1) {
-				perror("ptrace(POKEDATA restore)");
+				perror("ptrace(POKEDATA");
 				return;
 			}
 
+            // reinsert breakpoint
 			state.breakpoint_enabled = true;
-
-			if (ptrace(PTRACE_CONT, state.child_pid, 0, 0) == -1) {
-				perror("[Debugger] : ptrace\n");
-				return;
-			}
-
-			state.last_action = CONTINUE;
+			state.stepping_over_breakpoint = false;
         }
     }
 
-	state.run_state = STOPPED;
+    state.run_state = STOPPED;
 }
 
 int main(int argc, char *argv[]) {
@@ -254,18 +240,37 @@ int main(int argc, char *argv[]) {
 					perror("ptrace(CONT)");
 					break;
 				}
+
 				state.last_action = CONTINUE;
 				state.run_state = RUNNING;
-				handle_debug_event(state);
+
+				if (waitpid(pid, &status, 0) == -1) {
+					perror("waitpid");
+					break;
+				}
+
+				handle_debug_event(state, status);
 			} else if (line == "step") {
 				if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1) {
 					perror("ptrace(SINGLESTEP)");
 					break;
 				}
+
 				state.last_action = SINGLESTEP;
 				state.run_state = RUNNING;
-				handle_debug_event(state);
+
+				if (waitpid(pid, &status, 0) == -1) {
+					perror("waitpid");
+					break;
+				}
+
+				handle_debug_event(state, status);
 			} else if (line == "regs") {
+				if (state.run_state != STOPPED) {
+					cout << "[Debugger] Process not stopped\n";
+					continue;
+				}
+
 				struct user_regs_struct regs;
 				if (ptrace(PTRACE_GETREGS, state.child_pid, nullptr, &regs) == -1) {
 					perror("ptrace(GETREGS)");
@@ -278,17 +283,6 @@ int main(int argc, char *argv[]) {
 			}
 
 			if (state.run_state == EXITED) {
-				break;
-			}
-
-			// Detect child exit
-			if (WIFEXITED(status)) {
-				cout << "[Debugger] : Child exited with code " << WEXITSTATUS(status) << "\n";
-				break;
-			}
-
-			if (WIFSIGNALED(status)) {
-				cout << "[Debugger] : Child terminated by signal " << WTERMSIG(status) << "\n";
 				break;
 			}
 		}
