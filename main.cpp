@@ -4,6 +4,7 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <cstdint>			// Required for uintptr_t
+#include <unordered_map>
 
 #include <sys/wait.h>		// Required for wait()
 #include <sys/ptrace.h>		// Required for ptrace()
@@ -14,6 +15,12 @@ using namespace std;
 enum LastAction { NONE, CONTINUE, SINGLESTEP };
 enum RunState { STOPPED, RUNNING, EXITED };
 
+struct Breakpoint {
+	uintptr_t address;
+	uint8_t original_byte;
+	bool enabled;
+};
+
 struct Debugger_State {
 	pid_t child_pid;
 	uintptr_t breakpoint_addr;
@@ -22,6 +29,7 @@ struct Debugger_State {
 	uint8_t original_byte;
 	RunState run_state;
 	bool stepping_over_breakpoint = false;
+	unordered_map<uintptr_t, Breakpoint> breakpoints;
 } state;
 
 uintptr_t parse_breakpoint(const string& cmd) {
@@ -53,20 +61,21 @@ void handle_debug_event(Debugger_State &state, int status) {
 				return;
 			}
 
-            if (state.breakpoint_enabled && regs.rip - 1 == state.breakpoint_addr) {
+			uintptr_t hit_addr = regs.rip - 1;
+            if (state.breakpoints.count(hit_addr)) {
+				Breakpoint &bp = state.breakpoints[hit_addr];
+                cout << "[Debugger] Breakpoint hit at 0x" << hex << hit_addr << "\n";
 
-                cout << "[Debugger] Breakpoint hit at 0x" << hex << state.breakpoint_addr << "\n";
-
-                long data = ptrace(PTRACE_PEEKDATA, state.child_pid, (void*)state.breakpoint_addr, nullptr);
+                long data = ptrace(PTRACE_PEEKDATA, state.child_pid, (void*)hit_addr, nullptr);
 
 				if (data == -1) {
 					perror("ptrace(PEEKDATA)");
 					return;
 				}
 
-                long restored = (data & ~0xFF) | state.original_byte;
+                long restored = (data & ~0xFF) | bp.original_byte;
 
-                if (ptrace(PTRACE_POKEDATA, state.child_pid, (void*)state.breakpoint_addr, (void*)restored) == -1) {
+                if (ptrace(PTRACE_POKEDATA, state.child_pid, (void*)hit_addr, (void*)restored) == -1) {
 					perror("ptrace(POKEDATA");
 					return;
 				}
@@ -79,7 +88,7 @@ void handle_debug_event(Debugger_State &state, int status) {
 				}
 
 				state.stepping_over_breakpoint = true;
-                state.breakpoint_enabled = false;
+                bp.enabled = false;			// disable the breakpoint once reached
                 state.last_action = NONE;
             }
         }
@@ -210,31 +219,32 @@ int main(int argc, char *argv[]) {
 				// add breakpoint
 
 				// 1. parse address
-				state.breakpoint_addr = parse_breakpoint(line);
-			
-				// 2. insert breakpoint
-				long data = ptrace(PTRACE_PEEKDATA, pid, (void*)state.breakpoint_addr, nullptr);
+				uintptr_t breakpoint_addr = parse_breakpoint(line);
+				if (state.breakpoints.find(breakpoint_addr) == state.breakpoints.end()) {
+					// new breakpoint insert and populate the breakpoints
+					long data = ptrace(PTRACE_PEEKDATA, pid, (void*)state.breakpoint_addr, nullptr);
 
-				if (data == -1) {
-					perror("ptrace(PEEKDATA)");
-					break;
+					if (data == -1) {
+						perror("ptrace(PEEKDATA)");
+						break;
+					}
+
+					// Save original byte
+					uint8_t original_byte = static_cast<uint8_t>(data & 0xFF);
+
+					state.breakpoints[breakpoint_addr] = {breakpoint_addr, original_byte, true};
+
+					// Replace lowest byte with INT3 (0xCC)
+					long patched_data = (data & ~0xFF) | 0xCC;
+
+					// insert INT3 at lower byte
+					if (ptrace(PTRACE_POKEDATA, pid, reinterpret_cast<void*>(breakpoint_addr), reinterpret_cast<void*>(patched_data)) == -1) {
+						perror("ptrace(POKEDATA)");
+						return 1;
+					}
+				} else {
+					cout << "Breakpoint already set at 0x" << hex << breakpoint_addr << "\n";
 				}
-
-				// Save original byte
-				state.original_byte = static_cast<uint8_t>(data & 0xFF);
-
-				// Replace lowest byte with INT3 (0xCC)
-				long patched_data = (data & ~0xFF) | 0xCC;
-
-				// insert INT3 at lower byte
-				if (ptrace(PTRACE_POKEDATA, pid, reinterpret_cast<void*>(state.breakpoint_addr), reinterpret_cast<void*>(patched_data)) == -1) {
-					perror("ptrace(POKEDATA)");
-					return 1;
-				}
-
-				// cout << "[Debugger] Breakpoint set at 0x" << hex << state.breakpoint_addr << "\n";
-				state.breakpoint_enabled = true;
-			
 			} else if (line == "run" || line == "continue") {
 				if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
 					perror("ptrace(CONT)");
@@ -292,5 +302,3 @@ int main(int argc, char *argv[]) {
 	}
 	return 0;
 }
-
-
