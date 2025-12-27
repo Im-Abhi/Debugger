@@ -41,6 +41,7 @@ g++ main.cpp -o a
 - `regs` currently displays 3 registers (`RIP, RSP, RAX`)
 - `b <breakpoint_address>` adds a single breakpoint at the specified address
 - `quit` exits the debugger process
+- `d <breakpoint_address>` deletes breakpoint at the specified address if exists
 
 ### 4. Finding addresses from the debuggee 
 ```bash
