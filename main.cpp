@@ -23,12 +23,10 @@ struct Breakpoint {
 
 struct Debugger_State {
 	pid_t child_pid;
-	uintptr_t breakpoint_addr;
-	bool breakpoint_enabled = false;
 	LastAction last_action;
-	uint8_t original_byte;
 	RunState run_state;
 	bool stepping_over_breakpoint = false;
+	uintptr_t stepping_bp_addr;
 	unordered_map<uintptr_t, Breakpoint> breakpoints;
 } state;
 
@@ -62,8 +60,11 @@ void handle_debug_event(Debugger_State &state, int status) {
 			}
 
 			uintptr_t hit_addr = regs.rip - 1;
-            if (state.breakpoints.count(hit_addr)) {
+            if (state.breakpoints.count(hit_addr) && state.breakpoints[hit_addr].enabled) {
 				Breakpoint &bp = state.breakpoints[hit_addr];
+
+				state.stepping_bp_addr = hit_addr;
+
                 cout << "[Debugger] Breakpoint hit at 0x" << hex << hit_addr << "\n";
 
                 long data = ptrace(PTRACE_PEEKDATA, state.child_pid, (void*)hit_addr, nullptr);
@@ -94,7 +95,14 @@ void handle_debug_event(Debugger_State &state, int status) {
         }
 
         else if (state.last_action == SINGLESTEP && state.stepping_over_breakpoint) {
-            long data = ptrace(PTRACE_PEEKDATA, state.child_pid, (void*)state.breakpoint_addr, nullptr);
+			uintptr_t addr = state.stepping_bp_addr;
+
+			if (!state.breakpoints.count(addr)) {
+				state.stepping_over_breakpoint = false;
+				return;
+			}
+
+            long data = ptrace(PTRACE_PEEKDATA, state.child_pid, (void*)addr, nullptr);
 
 			if (data == -1) {
 				perror("ptrace(PEEKDATA)");
@@ -103,14 +111,15 @@ void handle_debug_event(Debugger_State &state, int status) {
 
             long patched = (data & ~0xFF) | 0xCC;
 
-			if (ptrace(PTRACE_POKEDATA, state.child_pid, (void*)state.breakpoint_addr, (void*)patched) == -1) {
+			if (ptrace(PTRACE_POKEDATA, state.child_pid, (void*)addr, (void*)patched) == -1) {
 				perror("ptrace(POKEDATA");
 				return;
 			}
 
-            // reinsert breakpoint
-			state.breakpoint_enabled = true;
+			state.breakpoints[addr].enabled = true;
 			state.stepping_over_breakpoint = false;
+			state.stepping_bp_addr = 0;
+			state.last_action = NONE;
         }
     }
 
@@ -222,11 +231,11 @@ int main(int argc, char *argv[]) {
 				uintptr_t breakpoint_addr = parse_breakpoint(line);
 				if (state.breakpoints.find(breakpoint_addr) == state.breakpoints.end()) {
 					// new breakpoint insert and populate the breakpoints
-					long data = ptrace(PTRACE_PEEKDATA, pid, (void*)state.breakpoint_addr, nullptr);
+					long data = ptrace(PTRACE_PEEKDATA, pid, (void*)breakpoint_addr, nullptr);
 
 					if (data == -1) {
 						perror("ptrace(PEEKDATA)");
-						break;
+						continue;
 					}
 
 					// Save original byte
