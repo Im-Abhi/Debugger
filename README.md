@@ -40,7 +40,7 @@ g++ main.cpp -o a
 - `continue` resumes execution of the debugee
 - `regs` currently displays 3 registers (`RIP, RSP, RAX`)
 - `b <breakpoint_address>` adds a single breakpoint at the specified address
-- `exit` exits the debugger process
+- `quit` exits the debugger process
 
 ### 4. Finding addresses from the debuggee 
 ```bash
