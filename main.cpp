@@ -28,6 +28,7 @@ struct Debugger_State {
 	bool stepping_over_breakpoint = false;
 	uintptr_t stepping_bp_addr;
 	unordered_map<uintptr_t, Breakpoint> breakpoints;
+	bool just_execed = true;
 } state;
 
 uintptr_t parse_breakpoint(const string& cmd) {
@@ -45,6 +46,11 @@ uintptr_t parse_breakpoint(const string& cmd) {
 }
 
 void handle_debug_event(Debugger_State &state, int status) {
+	if (state.just_execed) {
+		state.run_state = STOPPED;
+		return;
+	}
+
     if (WIFEXITED(status) || WIFSIGNALED(status)) {
         state.run_state = EXITED;
         return;
@@ -216,6 +222,7 @@ int main(int argc, char *argv[]) {
 			return 1;
 		} 
 		
+		state.just_execed = false;
 		string line;
 
 		while(1) {
@@ -270,6 +277,11 @@ int main(int argc, char *argv[]) {
 
 				handle_debug_event(state, status);
 			} else if (line == "step") {
+				if (state.stepping_over_breakpoint && state.last_action == SINGLESTEP) {
+					cout << "[Debugger] Finish stepping over breakpoint first\n";
+					continue;
+				}
+
 				if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1) {
 					perror("ptrace(SINGLESTEP)");
 					break;
@@ -299,6 +311,40 @@ int main(int argc, char *argv[]) {
 				cout << "RIP = 0x" << regs.rip << "\n";
 				cout << "RSP = 0x" << regs.rsp << "\n";
 				cout << "RAX = 0x" << regs.rax << "\n";
+			} else if (line[0] == 'd') {
+				uintptr_t addr = parse_breakpoint(line);
+
+				if (!state.breakpoints.count(addr)) {
+					cout << "No breakpoint at 0x" << hex << addr << "\n";
+					continue;
+				}
+
+				Breakpoint &bp = state.breakpoints[addr];
+
+				if (bp.enabled) {
+					long data = ptrace(PTRACE_PEEKDATA, pid, (void*)addr, nullptr);
+
+					if (data == -1) {
+						perror("ptrace(PEEKDATA)");
+						continue;
+					}
+
+					long restored = (data & ~0xFF) | bp.original_byte;
+
+					if (ptrace(PTRACE_POKEDATA, pid, (void*)addr, (void*)restored) == -1) {
+						perror("ptrace(POKEDATA)");
+						continue;
+					}
+				}
+
+				state.breakpoints.erase(addr);
+
+				if (state.stepping_bp_addr == addr) {
+					state.stepping_over_breakpoint = false;
+					state.stepping_bp_addr = 0;
+				}
+
+				cout << "[Debugger] Breakpoint removed at 0x" << hex << addr << "\n";
 			}
 
 			if (state.run_state == EXITED) {
